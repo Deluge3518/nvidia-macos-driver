@@ -16,7 +16,10 @@ permissions:
 
 env:
   BASE_REPO: nullmoth/nvidia-macos-driver
-  BASE_VERSION: 2.3.1
+  # 2.3.3, not 2.3.1: the 2.3.0/2.3.1 packages shipped NVMTLDriver built with minos 26.0, which dyld and the
+  # runtime check refuse on Sequoia ("runtime payload requires macOS 26.0.0"). 2.3.3 carries the same 2.3.1
+  # driver with the plugin rebuilt for macOS 15 and the hardened runtime check (upstream CHANGELOG 2.3.2/2.3.3).
+  BASE_VERSION: 2.3.3
 
 jobs:
   build:
