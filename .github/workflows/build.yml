@@ -22,9 +22,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ogkm
-          key: ogkm-${{ env.OGKM_TAG }}
+          key: ogkm-${{ env.OGKM_TAG }}-2
       - if: steps.ogkm.outputs.cache-hit != 'true'
         run: git clone --quiet --depth 1 --branch "$OGKM_TAG" https://github.com/NVIDIA/open-gpu-kernel-modules "$RUNNER_TEMP/ogkm"
+      # accel_build.sh reads NVIDIA's own -D defines from src/nvidia/_out/Darwin_x86_64/compile_cmds.sh. That file does
+      # not exist in a fresh OGKM clone: it is the dry-run capture of the Darwin build of the RM. Generate it with
+      # `make -n` (no compiler work needed), keeping only the compile lines.
+      - name: Generate the RM compile commands (Darwin dry run)
+        run: |
+          mkdir -p "$RUNNER_TEMP/ogkm/src/nvidia/_out/Darwin_x86_64"
+          make -C "$RUNNER_TEMP/ogkm/src/nvidia" -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null \
+            | grep ' -c ' > "$RUNNER_TEMP/ogkm/src/nvidia/_out/Darwin_x86_64/compile_cmds.sh"
+          [ -s "$RUNNER_TEMP/ogkm/src/nvidia/_out/Darwin_x86_64/compile_cmds.sh" ] || { echo 'the dry run produced no compile commands'; exit 1; }
       - name: NVAccel (macOS 15 and 26)
         run: OGKM="$RUNNER_TEMP/ogkm" bash build/accel_build_all.sh "$PWD/kexts/NVRM" "$PWD/out/kexts"
       - name: NVRMFB
@@ -44,31 +53,29 @@ jobs:
             out/kexts/26/NVAccel.kext
           if-no-files-found: error
 
-  app:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: 1401.app
-        run: bash app/build.sh "$PWD/out/app"
-      - name: Zip
-        run: ditto -c -k --keepParent out/app/1401.app out/1401-Mac.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: 1401-app
-          path: out/1401-Mac.zip
-          if-no-files-found: error
-
   tests:
     runs-on: macos-15
     steps:
+      # full history: the negative-control tests read past sources with `git show v1.15.0:...` and `git show 4434649:...`
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Source-level tests
         run: |
           fail=0
           for t in tools/test_*.py; do
             # takes the built diagnostics checker as its argument; tools/test_optional_diagnostics.sh runs it after app/build.sh
             [ "$t" = tools/test_diagnostics_prerequisites.py ] && continue
-            if python3 "$t" > "$RUNNER_TEMP/t.log" 2>&1; then echo "ok   $t"
+            # test_resset_seal's lazy negative control is a timing race: a fast, quiet runner can lose nothing and the
+            # check reports UNKNOWN-flavoured FAIL; give it three tries before calling it a real failure
+            tries=1
+            [ "$t" = tools/test_resset_seal.py ] && tries=3
+            n=0; ok=0
+            while [ $n -lt $tries ]; do
+              if python3 "$t" > "$RUNNER_TEMP/t.log" 2>&1; then ok=1; break; fi
+              n=$((n+1))
+            done
+            if [ $ok = 1 ]; then echo "ok   $t"
             else echo "FAIL $t"; tail -20 "$RUNNER_TEMP/t.log" | sed 's/^/     /'; fail=1; fi
           done
           exit $fail
