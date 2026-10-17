@@ -29,6 +29,7 @@
 #include "../nvrm_eld.h"
 #include "nvrm-hud.h"
 #include "nvrm-fb-safety.h"
+#include "nvrm-panel144.h"
 #include "nvrm-allocation-table.h"
 static IORecursiveLock *startLock();
 class NVRMCallReference {
@@ -244,6 +245,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // The panel's physical size in millimetres, from the EDID's base block. Reported per mode as
     // IODisplayModeInformation.imageWidth/imageHeight; see nvrmEdidPanelSizeMm().
     NvU16 fEdidMmW = 0, fEdidMmH = 0;
+    bool fPanel144 = false;
+    bool fPanel144Override = false;
+    bool reapplyPanel144();
     bool fModeSet = false;
     unsigned fHomePure = 0;
     IODetailedTimingInformationV2 fDT[128]; unsigned fNDT = 0;
@@ -266,6 +270,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // The scanout and cursor bytes this head mapped into BAR1 (video memory only), counted once into gVramDisplayBytes.
     NvU64 fScanoutBarBytes = 0, fCursorBarBytes = 0;
     unsigned fModeSwitches = 0, fValidateCalls = 0, fValidateOk = 0;
+    unsigned fHiDPIPreflightTests = 0;
+    bool fHiDPIRecoveryUnverified = false;
+    IOReturn preflightScaledMode(const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h);
+
     bool fBootInDT = false;
     int dtIndex(IODisplayModeID id) const;
     bool edidModeFor(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m);
@@ -445,6 +453,7 @@ public:
 OSDefineMetaClassAndStructors(NVRMNVDAFramebuffer, IOFramebuffer)
 struct nvrm_dpy_rec {
     NvKmsKapiDisplay handle; NvKmsKapiConnector connector; NvU32 headMask; NvBool internal;
+    bool panel144Override;
     NvU32 edidSize; NvU8 edid[NVKMS_KAPI_EDID_BUFFER_SIZE];
 };
 static struct NvKmsKapiDevice *gDev;
@@ -618,6 +627,27 @@ static void nvrmHeadConfigBaseline(struct NvKmsKapiHeadRequestedConfig *hr, stru
         lr->config.csc.m[2][2] = 0x10000;
         lr->flags.cscChanged = NV_TRUE;
     }
+}
+// Qualification and commit must exercise the same layer dimensions and flags.
+// The caller zeroes cfg and serializes access with NVRMDisplayGate.
+static void nvrmBuildModeRequest(struct NvKmsKapiRequestedModeSetConfig *cfg,
+                                 NvU32 head, NvKmsKapiDisplay display,
+                                 const struct NvKmsKapiDisplayMode &m,
+                                 struct NvKmsKapiSurface *ns, NvU32 w, NvU32 h,
+                                 struct NvKmsLutRamps *gamma = NULL)
+{
+    cfg->headsMask = 1u << head;
+    struct NvKmsKapiHeadRequestedConfig *hr = &cfg->headRequestedConfig[head];
+    nvrmHeadConfigBaseline(hr, gamma);
+    hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = display;
+    hr->modeSetConfig.mode = m;
+    hr->flags.activeChanged = hr->flags.displaysChanged = hr->flags.modeChanged = NV_TRUE;
+    struct NvKmsKapiLayerRequestedConfig *lr = &hr->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    lr->config.surface = ns; lr->config.srcWidth = w; lr->config.srcHeight = h;
+    lr->config.dstWidth = m.timings.hVisible; lr->config.dstHeight = m.timings.vVisible;
+    lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
+    lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
+    nvrmUnownedHeadsOff(cfg);
 }
 void NVRMNVDAFramebuffer::surveyBar1()
 {
@@ -837,6 +867,22 @@ bool NVRMNVDAFramebuffer::kapiInit()
               fIndex, fDisplay, (unsigned)fConnector, (unsigned)r->headMask, fHead,
               (unsigned)gHeadsTaken);
     }
+    OSBoolean *panelOpt = OSDynamicCast(OSBoolean, getProperty("NMPanel144Enabled"));
+    char panelOff[8] = {};
+    if (panelOpt && panelOpt->isTrue() && !PE_parse_boot_argn("-nmpanel144off", panelOff, sizeof panelOff) && panel144Matches(fEdid, fEdidSize)) {
+        fPanel144 = true;
+        setProperty("NMPanel144Build", "2.0.4-local-boe144-1080hidpi-r1");
+        fPanel144Override = reapplyPanel144();
+        if (fPanel144Override) {
+            fEdidSize = sizeof kPanel144Edid;
+            nvu_copy(fEdid, kPanel144Edid, sizeof kPanel144Edid);
+            gDpy[fIndex].panel144Override = true;
+            gDpy[fIndex].edidSize = sizeof kPanel144Edid;
+            nvu_copy(gDpy[fIndex].edid, kPanel144Edid, sizeof kPanel144Edid);
+        }
+        setProperty("NMPanel144OverrideApplied", fPanel144Override);
+        FBLOG("panel144: exact BOE EDID match; NVKMS override %s; boot requires native 60Hz", fPanel144Override ? "accepted" : "failed (60Hz only fallback)");
+    }
     // This mode becomes the head's boot raster (fBootW/fBootH below), which decides the scaler and
     // raster ceilings and which refresh rates addKmsRefreshModes() can publish. A NVKMS-preferred mode
     // is the EDID native timing and wins outright. When no mode is flagged preferred -- common on a
@@ -853,6 +899,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
         int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
         if (r < 0) break;
         if (r == 0 || !valid) continue;
+        if (fPanel144) {
+            const NvKmsKapiDisplayModeTimings &t = m.timings;
+            // First boot must not select the untested 144Hz or the firmware's 165Hz.
+            if (t.hVisible != 2560 || t.vVisible != 1440 || t.hTotal != 2736 || t.vTotal != 1560 ||
+                t.pixelClockHz < 256080000 || t.pixelClockHz > 256100000) continue;
+            fMode = m; have = true; break;
+        }
         if (preferred) { fMode = m; have = true; break; }
         const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
         if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
@@ -863,21 +916,25 @@ bool NVRMNVDAFramebuffer::kapiInit()
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
     fKmsMode = fMode; fHaveKmsMode = true;
     if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
-        // the fallback for a refused firmware timing must be the same raster (it scans out the same surface): the
-        // validated mode at the boot size whose refresh is closest to the firmware's
-        bool same = false; NvU32 bestGap = 0;
-        for (NvU32 i = 0; i < 256; i++) {
-            struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
-            int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
-            if (r < 0) break;
-            if (r == 0 || !valid || m.timings.hVisible != gBootMode.timings.hVisible ||
-                m.timings.vVisible != gBootMode.timings.vVisible) continue;
-            const NvU32 gap = m.timings.refreshRate > gBootMode.timings.refreshRate ?
-                m.timings.refreshRate - gBootMode.timings.refreshRate : gBootMode.timings.refreshRate - m.timings.refreshRate;
-            if (!same || gap < bestGap) { fKmsMode = m; bestGap = gap; same = true; }
+        if (fPanel144) {
+            FBLOG("panel144: retains qualified boot raster on firmware head %u", fHead);
+        } else {
+            // the fallback for a refused firmware timing must be the same raster (it scans out the same surface): the
+            // validated mode at the boot size whose refresh is closest to the firmware's
+            bool same = false; NvU32 bestGap = 0;
+            for (NvU32 i = 0; i < 256; i++) {
+                struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+                int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
+                if (r < 0) break;
+                if (r == 0 || !valid || m.timings.hVisible != gBootMode.timings.hVisible ||
+                    m.timings.vVisible != gBootMode.timings.vVisible) continue;
+                const NvU32 gap = m.timings.refreshRate > gBootMode.timings.refreshRate ?
+                    m.timings.refreshRate - gBootMode.timings.refreshRate : gBootMode.timings.refreshRate - m.timings.refreshRate;
+                if (!same || gap < bestGap) { fKmsMode = m; bestGap = gap; same = true; }
+            }
+            fHaveKmsMode = same;
+            fMode = gBootMode;
         }
-        fHaveKmsMode = same;
-        fMode = gBootMode;
         fBootConsole = true;
         FBLOG("boot pair: display 0x%x keeps the firmware's mode %ux%u @%u on head %u", fDisplay,
               fMode.timings.hVisible, fMode.timings.vVisible, fMode.timings.refreshRate, fHead);
@@ -896,6 +953,15 @@ bool NVRMNVDAFramebuffer::kapiInit()
     {
         fBootMode = fMode; fBootW = fW; fBootH = fH; fBootPitch = fPitch; fRasterW = fW; fRasterH = fH; fPitchAlign = pitchAlign;
         computeScanoutCaps(pitchAlign);
+        // BOE's physical EDID is 1440p, while the one qualified desktop renders
+        // at 3840x2160. Reserve that scanout explicitly; upstream native-panel
+        // caps alone would reject this downscaled HiDPI mode before preflight.
+        if (fPanel144 && fPanel144Override) {
+            fScalerMaxW = 3840; fScalerMaxH = 2160; fRasterMaxW = 2560;
+            const NvU64 localPitch = (3840ull * 4 + pitchAlign - 1) & ~(NvU64)(pitchAlign - 1);
+            fAllocSize = (localPitch * 2160 + 0xffff) & ~0xffffull;
+            if (fAllocSize < fSize) fAllocSize = fSize;
+        }
         FBLOG("fbmodes: boot raster %ux%u pitch %u; scanout allocation sized for %ux%u (%llu KB, boot needs %llu KB)",
               fW, fH, fPitch, fScalerMaxW, fScalerMaxH, fAllocSize / 1024, fSize / 1024);
     }
@@ -1212,6 +1278,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
+        for (int k = 0; k < gNDpy; k++) {
+            if (gDpy[k].handle != handles[i] || !gDpy[k].panel144Override) continue;
+            dd->overrideEdid = NV_TRUE; dd->edid.bufferSize = sizeof kPanel144Edid;
+            nvu_copy(dd->edid.buffer, kPanel144Edid, sizeof kPanel144Edid);
+            break;
+        }
         bool dynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
         if (known) {
             // 1401/driver issue #110: switching the monitor to another input and back left it with no picture. The link
@@ -1454,6 +1526,7 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
 }
 bool NVRMNVDAFramebuffer::reflip()
 {
+    if (fPanel144 && !panel144RateAllowed(fMode.timings.pixelClockHz, fMode.timings.hTotal, fMode.timings.vTotal)) return false;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (!fKms || !fDev || !fSurf) return false;
     struct NvKmsKapiSurface *front = fFrontSurf ? fFrontSurf : fSurf;
@@ -1882,6 +1955,7 @@ void NVRMNVDAFramebuffer::headProbeFire(thread_call_param_t p0, thread_call_para
 }
 bool NVRMNVDAFramebuffer::applyMode()
 {
+    if (fPanel144 && !panel144RateAllowed(fMode.timings.pixelClockHz, fMode.timings.hTotal, fMode.timings.vTotal)) return false;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (fConsoleAperture) {
         FBLOG("applyMode: skipped (console aperture mode -- the GOP drives this panel)");
@@ -2168,6 +2242,10 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
 {
     FBLOG("fb%u setDisplayMode 0x%x depth %d (current 0x%x)", fIndex, (unsigned)mode, (int)depth, (unsigned)fCurId);
     if (depth != 0) return kIOReturnUnsupportedMode;
+    if (fPanel144 && fHiDPIRecoveryUnverified) {
+        FBLOG("hidpi-recovery: refusing further modeset; prior scaled failure needs reboot/verified recovery");
+        return kIOReturnNotReady;
+    }
     if (mode == kModeId) {
         if (fCurId == kModeId) return applyMode() ? kIOReturnSuccess : kIOReturnError;
         return switchMode(kModeId, fBootMode, fBootW, fBootH);
@@ -2179,7 +2257,18 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
     if (!edidModeFor(&fDT[i], &m)) dtToKapi(&fDT[i], &m);
     const NvU32 w = fDT[i].horizontalScaled ? fDT[i].horizontalScaled : fDT[i].horizontalActive;
     const NvU32 h = fDT[i].verticalScaled ? fDT[i].verticalScaled : fDT[i].verticalActive;
-    return switchMode(mode, m, w, h);
+    const IOReturn result = switchMode(mode, m, w, h);
+    // Cover early allocation/readiness failures too: WindowServer has already
+    // begun reconfiguration before this callback. Test-only preflight is outside
+    // this path and must not poison the current native desktop.
+    if (fPanel144 && result != kIOReturnSuccess &&
+        (w != m.timings.hVisible || h != m.timings.vVisible)) {
+        fHiDPIRecoveryUnverified = true;
+        setProperty("NMHiDPIRecoveryUnverified", true);
+        setProperty("NMHiDPIActivationError", (unsigned long long)(UInt32)result, 32);
+        FBLOG("hidpi-recovery: scaled request failed (%x); current mode is not proof of desktop recovery", result);
+    }
+    return result;
 }
 void NVRMNVDAFramebuffer::dtToKapi(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m)
 {
@@ -2205,6 +2294,7 @@ bool NVRMNVDAFramebuffer::edidModeFor(const IODetailedTimingInformationV2 *d, st
         if (r < 0) break;
         if (r == 0 || !valid) continue;
         const struct NvKmsKapiDisplayModeTimings &k = m.timings;
+        if (fPanel144 && !panel144RateAllowed(k.pixelClockHz, k.hTotal, k.vTotal)) continue;
         if (k.hVisible != d->horizontalActive || k.vVisible != d->verticalActive || k.hTotal != ht || k.vTotal != vt) continue;
         const NvU64 pc = k.pixelClockHz, want = d->pixelClock, diff = pc > want ? pc - want : want - pc;
         if (diff * 500 > want) continue;
@@ -2280,6 +2370,7 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         if (r < 0) break;
         if (r == 0 || !valid) continue;
         const struct NvKmsKapiDisplayModeTimings &k = m.timings;
+        if (fPanel144 && !panel144RateAllowed(k.pixelClockHz, k.hTotal, k.vTotal)) continue;
         if (k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz || k.hTotal <= k.hVisible || k.vTotal <= k.vVisible ||
             k.hSyncStart < k.hVisible || k.hSyncEnd < k.hSyncStart || k.vSyncStart < k.vVisible || k.vSyncEnd < k.vSyncStart) continue;
         const NvU64 tot = (NvU64)k.hTotal * k.vTotal;
@@ -2349,6 +2440,10 @@ int NVRMNVDAFramebuffer::dtIndex(IODisplayModeID id) const
 }
 IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h)
 {
+    if (fPanel144 && !panel144RateAllowed(m.timings.pixelClockHz, m.timings.hTotal, m.timings.vTotal))
+        return kIOReturnUnsupportedMode;
+    if (fPanel144 && !panel144GeometryAllowed(w, h, m.timings.hVisible, m.timings.vVisible))
+        return kIOReturnUnsupportedMode;
     NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
     if (fSubmissionFaulted) return kIOReturnNotReady;
     if (!fKms || !fDev || !fMem || fConsoleAperture) return kIOReturnNotReady;
@@ -2370,18 +2465,8 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     NvBool ok = NV_FALSE;
     for (int commit = 0; commit < 2; commit++) {
         nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
-        cfg->headsMask = 1u << fHead;
-        struct NvKmsKapiHeadRequestedConfig *hr = &cfg->headRequestedConfig[fHead];
-        nvrmHeadConfigBaseline(hr, fGammaOn ? fGamma : NULL);
-        hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = fDisplay;
-        hr->modeSetConfig.mode = m;
-        hr->flags.activeChanged = hr->flags.displaysChanged = hr->flags.modeChanged = NV_TRUE;
-        struct NvKmsKapiLayerRequestedConfig *lr = &hr->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
-        lr->config.surface = ns; lr->config.srcWidth = w; lr->config.srcHeight = h;
-        lr->config.dstWidth = m.timings.hVisible; lr->config.dstHeight = m.timings.vVisible;
-        lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
-        lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
-        nvrmUnownedHeadsOff(cfg);
+        rep->flipResult = NV_KMS_FLIP_RESULT_INVALID_PARAMS;
+        nvrmBuildModeRequest(cfg, fHead, fDisplay, m, ns, w, h, fGammaOn ? fGamma : NULL);
         ok = submitConfig(cfg, rep, commit ? NV_TRUE : NV_FALSE);
         FBLOG("switchMode 0x%x: %s %ux%u -> raster %ux%u @%u mHz pclk %u -> %u (flipResult %d)", (unsigned)id,
               commit ? "COMMIT" : "test", w, h, m.timings.hVisible, m.timings.vVisible, m.timings.refreshRate,
@@ -2389,7 +2474,10 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
         if (!ok) break;
     }
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
-    if (!ok) { if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns); return kIOReturnUnsupportedMode; }
+    if (!ok) {
+        if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns);
+        return kIOReturnUnsupportedMode;
+    }
     struct NvKmsKapiSurface *old = fSurf;
     fSurf = ns; fFrontSurf = ns; fMode = m; fW = w; fH = h; fPitch = pitch;
     fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
@@ -2404,6 +2492,48 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     setProperty("NVRMModeSwitches", (unsigned long long)fModeSwitches, 32);
     return kIOReturnSuccess;
 }
+// A test-only submission during timing qualification, before WindowServer
+// dismantles its current desktop. No COMMIT, clear, copy, or live-mode mutation.
+IOReturn NVRMNVDAFramebuffer::preflightScaledMode(const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h)
+{
+    NVRMDisplayGate gate;
+    if (!gate.valid() || !fKms || !fDev || !fMem || fConsoleAperture ||
+        fSubmissionFaulted || fHead >= NVKMS_KAPI_MAX_HEADS)
+        return kIOReturnNotReady;
+    NvU32 pitch = 0;
+    if (!w || !h || !nvrmCheckedPitch(w, fPitchAlign, &pitch) ||
+        (NvU64)pitch * h > fMemBytes)
+        return kIOReturnNoMemory;
+    struct NvKmsKapiCreateSurfaceParams sp = {};
+    sp.planes[0].memory = fMem; sp.planes[0].pitch = pitch;
+    sp.width = w; sp.height = h; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
+    struct NvKmsKapiSurface *surface = fKms->createSurface(fDev, &sp);
+    if (!surface) return kIOReturnNoMemory;
+    auto *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof(struct NvKmsKapiRequestedModeSetConfig));
+    auto *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof(struct NvKmsKapiModeSetReplyConfig));
+    if (!cfg || !rep) {
+        if (cfg) IOFree(cfg, sizeof *cfg);
+        if (rep) IOFree(rep, sizeof *rep);
+        fKms->destroySurface(fDev, surface);
+        return kIOReturnNoMemory;
+    }
+    nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
+    rep->flipResult = NV_KMS_FLIP_RESULT_INVALID_PARAMS; // unwritten reply must fail closed
+    nvrmBuildModeRequest(cfg, fHead, fDisplay, m, surface, w, h, fGammaOn ? fGamma : NULL);
+    const NvBool accepted = submitConfig(cfg, rep, NV_FALSE);
+    const bool valid = accepted && rep->flipResult == NV_KMS_FLIP_RESULT_SUCCESS;
+    ++fHiDPIPreflightTests;
+    FBLOG("hidpi-preflight #%u head %u source %ux%u raster %ux%u pclk %u accepted %u reply %d (test-only)",
+          fHiDPIPreflightTests, fHead, w, h, m.timings.hVisible, m.timings.vVisible,
+          m.timings.pixelClockHz, (unsigned)accepted, (int)rep->flipResult);
+    setProperty("NMHiDPIPreflightCount", (unsigned long long)fHiDPIPreflightTests, 32);
+    setProperty("NMHiDPIPreflightAccepted", valid);
+    setProperty("NMHiDPIPreflightReply", (unsigned long long)(UInt32)rep->flipResult, 32);
+    IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
+    fKms->destroySurface(fDev, surface); // test-only never queued this surface
+    return valid ? kIOReturnSuccess : kIOReturnUnsupportedMode;
+}
+
 IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCount descripSize)
 {
     if (!description) return kIOReturnBadArgument;
@@ -2415,7 +2545,14 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
     fValidateCalls++;
     if (!d || !fKms || !fDev || !fDisplay) return kIOReturnBadArgument;
     const char *why = nullptr;
-    if (d->horizontalScaledInset || d->verticalScaledInset) why = "inset (no kIOScaleCanSupportInset)";
+    if (fPanel144 && !panel144RateAllowed(d->pixelClock,
+            (NvU64)d->horizontalActive + d->horizontalBlanking,
+            (NvU64)d->verticalActive + d->verticalBlanking)) why = "panel144 refresh ceiling";
+    else if (fPanel144 && !panel144GeometryAllowed(
+            d->horizontalScaled ? d->horizontalScaled : d->horizontalActive,
+            d->verticalScaled ? d->verticalScaled : d->verticalActive,
+            d->horizontalActive, d->verticalActive)) why = "only 1920x1080 HiDPI is qualified";
+    else if (d->horizontalScaledInset || d->verticalScaledInset) why = "inset (no kIOScaleCanSupportInset)";
     else if (d->scalerFlags & ~(UInt32)kIOScaleStretchToFit) why = "rotation/axis flags";
     else if (d->horizontalBorderLeft | d->horizontalBorderRight | d->verticalBorderTop | d->verticalBorderBottom) why = "borders";
     else if (!d->pixelClock || !d->horizontalActive || !d->verticalActive) why = "empty timing";
@@ -2430,6 +2567,18 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
         if (!edidModeFor(d, &m)) {
             dtToKapi(d, &m);
             if (!fKms->validateDisplayMode(fDev, fDisplay, &m)) why = "NVKMS validateDisplayMode refused the raster (not an EDID mode)";
+        }
+    }
+    // Local BOE experiment only; native-size (including 1280x720 HiDPI)
+    // has no downscale and retains the original qualification path.
+    if (!why && fPanel144 && d->horizontalScaled && d->verticalScaled &&
+        (d->horizontalScaled != d->horizontalActive || d->verticalScaled != d->verticalActive)) {
+        struct NvKmsKapiDisplayMode scaled = {};
+        if (!edidModeFor(d, &scaled)) dtToKapi(d, &scaled);
+        IOReturn preflight = preflightScaledMode(scaled, d->horizontalScaled, d->verticalScaled);
+        if (preflight != kIOReturnSuccess) {
+            setProperty("NMHiDPIPreflightError", (unsigned long long)(UInt32)preflight, 32);
+            why = "full scaled-layer preflight not accepted (no mode change)";
         }
     }
     if (fValidateCalls <= 48 || why == nullptr)
@@ -2462,7 +2611,20 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
     for (unsigned i = 0; i < array->getCount() && n < 64; i++) {  // 64 from macOS; the rest of fDT is for addKmsRefreshModes
         OSData *data = OSDynamicCast(OSData, array->getObject(i));
         if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { bad++; continue; }
-        nvu_copy(&fDT[n++], data->getBytesNoCopy(), sizeof(IODetailedTimingInformationV2));
+        IODetailedTimingInformationV2 proposed;
+        nvu_copy(&proposed, data->getBytesNoCopy(), sizeof proposed);
+        if (fPanel144 && !panel144RateAllowed(proposed.pixelClock,
+                (NvU64)proposed.horizontalActive + proposed.horizontalBlanking,
+                (NvU64)proposed.verticalActive + proposed.verticalBlanking)) { bad++; continue; }
+        // Do not allow bulk timing publication to bypass the full-layer check.
+        if (fPanel144 && proposed.horizontalScaled && proposed.verticalScaled &&
+            (proposed.horizontalScaled != proposed.horizontalActive ||
+             proposed.verticalScaled != proposed.verticalActive) &&
+            validateDetailedTiming(&proposed, sizeof proposed) != kIOReturnSuccess) {
+            bad++;
+            continue;
+        }
+        fDT[n++] = proposed;
     }
     const unsigned fromMac = n;
     n = addKmsRefreshModes(n);
@@ -2502,7 +2664,7 @@ void NVRMNVDAFramebuffer::publishTimingCaps()
     r.minPixelClock = 25000000ull; r.maxPixelClock = 1200000000ull; r.maxPixelError = 0;
     r.supportedSyncFlags = kIORangeSupportsSeparateSyncs;
     r.supportedSignalLevels = 0; r.supportedSignalConfigs = kIODigitalSignal;
-    r.minFrameRate = 23; r.maxFrameRate = 500; r.minLineRate = 10000; r.maxLineRate = 1000000;
+    r.minFrameRate = 23; r.maxFrameRate = fPanel144 ? 144 : 500; r.minLineRate = 10000; r.maxLineRate = 1000000;
     r.maxHorizontalTotal = 16384; r.maxVerticalTotal = 16384;
     r.charSizeHorizontalActive = r.charSizeHorizontalBlanking = r.charSizeHorizontalSyncOffset = r.charSizeHorizontalSyncPulse = 1;
     r.charSizeVerticalActive = r.charSizeVerticalBlanking = r.charSizeVerticalSyncOffset = r.charSizeVerticalSyncPulse = 1;
@@ -3224,6 +3386,18 @@ bool NVRMNVDAFramebuffer::headOff()
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return ok ? true : false;
 }
+bool NVRMNVDAFramebuffer::reapplyPanel144()
+{
+    if (!fPanel144 || !fKms || !fDev || !fDisplay) return false;
+    struct NvKmsKapiDynamicDisplayParams *pd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *pd);
+    if (!pd) return false;
+    nvu_zero(pd, sizeof *pd); pd->handle = fDisplay; pd->overrideEdid = NV_TRUE;
+    pd->edid.bufferSize = sizeof kPanel144Edid;
+    nvu_copy(pd->edid.buffer, kPanel144Edid, sizeof kPanel144Edid);
+    const bool ok = fKms->getDynamicDisplayInfo(fDev, pd) && pd->connected;
+    IOFree(pd, sizeof *pd);
+    return ok;
+}
 bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
@@ -3240,7 +3414,16 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
             FBLOG("display wake: GPU not resumed yet - head %u is lit when NVRM resumes it", fHead);
             return true;
         }
-        const bool ok = reflip();
+        bool panelReady = !fPanel144Override;
+        if (fPanel144Override) {
+            // Reapply the local EDID only after NVRM has resumed the GPU.
+            // Bounded retries; failed wake stays retryable without changing refresh rate.
+            for (unsigned attempt = 0; attempt < 3; ++attempt) {
+                if (reapplyPanel144()) { panelReady = true; break; }
+                if (attempt < 2) IOSleep(50);
+            }
+        }
+        const bool ok = panelReady && reflip();
         // A rejected wake must remain retryable on the next power request.
         if (ok) fHeadSlept = false;
         FBLOG("display wake: head %u mode and surface committed again -> %s (rc %d)", fHead, ok ? "ok" : "FAILED", fReflipRc);

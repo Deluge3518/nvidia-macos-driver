@@ -29,6 +29,7 @@ struct NVRMDisplayGate {
     ~NVRMDisplayGate() { displayLock.unlock(); }
     bool valid() { return lockAvailable; }
 };
+static void IOSleep(unsigned ms) { assert(ms==50); }
 static bool PE_parse_boot_argn(const char*,char*,unsigned long) { return disabled; }
 static int OSAddAtomic(int n,int *value) { int old=*value;*value+=n;return old; }
 #define FBLOG(...) ((void)0)
@@ -36,6 +37,8 @@ struct NVRMNVDAFramebuffer {
     bool fHeadSlept=false, fModeSet=true, sleepOK=true, wakeOK=true;
     bool fPowerOn=true, pagingState=true, fSysSlept=false, gpuReady=true;
     unsigned familyWakes=0;
+    bool fPanel144Override=false;
+    bool reapplyPanel144() { assert(gpuReady); return true; }
     void *fSurf=this;
     unsigned fHead=0, sleeps=0, wakes=0, notifications=0;
     int fStopping=0, fReflipRc=0;

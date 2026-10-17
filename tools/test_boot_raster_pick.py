@@ -52,6 +52,7 @@ struct Kms {
 };
 struct FB {
     Kms *fKms=nullptr; void *fDev=this; unsigned fDisplay=1;
+    bool fPanel144=false;
     NvKmsKapiDisplayMode fMode{};
     bool pick() {
 SELECTION

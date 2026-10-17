@@ -15,6 +15,7 @@ fixture = r'''
 #include <cstring>
 #include <vector>
 using NvU32=uint32_t;using NvU64=uint64_t;using UInt64=uint64_t;using UInt16=uint16_t;using NvBool=bool;
+static bool panel144RateAllowed(uint64_t p,uint64_t h,uint64_t v) { return p && h && v && p*1000/(h*v)<=144100; }
 enum { NV_TRUE=1,NV_FALSE=0,kIODigitalSignal=1 };
 #define FBLOG(...) ((void)0)
 static void nvu_zero(void *p,size_t n){memset(p,0,n);}
@@ -38,7 +39,7 @@ struct Kms {
     }
 };
 struct NVRMNVDAFramebuffer {
-    Kms *fKms=nullptr;void *fDev=this;unsigned fDisplay=1,fIndex=0;
+    Kms *fKms=nullptr;void *fDev=this;unsigned fDisplay=1,fIndex=0; bool fPanel144=false;
     unsigned fBootW=2560,fBootH=1600,fScalerMaxW=3840,fScalerMaxH=2160,fRasterMaxW=5120,fPitchAlign=256;
     NvU64 fMemBytes=64ULL<<20;NvKmsKapiDisplayMode fBootMode;
     IODetailedTimingInformationV2 fDT[16];
@@ -60,6 +61,8 @@ int main() {
     assert(f.fDT[0].detailedTimingModeID==0x10000 && f.fDT[1].detailedTimingModeID==0x10100);
     assert(f.fDT[1].pixelClock==777321600 && !f.fDT[1].horizontalScaled);
     assert(f.addKmsRefreshModes(n)==n);
+    NVRMNVDAFramebuffer panel;panel.fKms=&kms;panel.fPanel144=true;panel.fBootMode=kms.modes[0];
+    assert(panel.addKmsRefreshModes(0)==1); // local panel excludes the generic 165Hz mode
     NVRMNVDAFramebuffer scaled;scaled.fKms=&kms;scaled.fBootMode=kms.modes[1];
     scaled.fDT[0]=f.fDT[1];scaled.fDT[0].horizontalScaled=1920;scaled.fDT[0].verticalScaled=1200;
     assert(scaled.addKmsRefreshModes(1)==3);

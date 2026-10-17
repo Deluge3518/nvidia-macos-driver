@@ -416,6 +416,7 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+static int nvmtl_xlate_ready(void);
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -455,6 +456,24 @@ static void nvmtl_install_hw_resource_pools(id dev)
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
     self = [super initWithAcceleratorPort:port];
     if (!self) { nvlog("  super initWithAcceleratorPort: returned nil"); return nil; }
+    // Overlap full translator initialization with device setup in allowed clients.
+    // WindowServer retains its accepted lazy path. Every return below joins the
+    // worker, so initialization failure cannot leave plugin code running detached.
+    dispatch_group_t translatorWarmup = nil;
+    const char *process = getprogname();
+    if (process && strcmp(process, "WindowServer") && nvmtl_process_is_allowed()) {
+        static dispatch_once_t warmOnce;
+        static dispatch_group_t warmGroup;
+        dispatch_once(&warmOnce, ^{
+            warmGroup = dispatch_group_create();
+            dispatch_group_async(warmGroup, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                @autoreleasepool { (void)nvmtl_xlate_ready(); }
+            });
+        });
+        translatorWarmup = warmGroup;
+    }
+    @try {
+
     {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
            accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
         uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
@@ -485,6 +504,9 @@ static void nvmtl_install_hw_resource_pools(id dev)
         #undef NVMTL_U
     } else nvlog("limits: -initLimits not found - every table-served limit stays 0 (CoreImage will refuse renders)");
     return self;
+    } @finally {
+        if (translatorWarmup) dispatch_group_wait(translatorWarmup, DISPATCH_TIME_FOREVER);
+    }
 }
 
 - (void)nvmtlProbeGPUPass {
@@ -853,6 +875,10 @@ static char nvmtl_surface_cache_key;
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    // IOSurface drawables use Unknown usage. Make their actual image writable
+    // before reporting ShaderWrite to Core Image; do not promote FBO or explicit usage.
+    if (surf && d.usage == MTLTextureUsageUnknown && !t->_fbo && nvmtl_vk_format_is_storage(vkf))
+        wantStex = 1;
     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same

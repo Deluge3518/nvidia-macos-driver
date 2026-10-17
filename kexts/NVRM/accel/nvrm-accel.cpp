@@ -47,6 +47,7 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #include "nvkms-kapi.h"
 #include <sys/sysctl.h>
 #include <libkern/OSAtomic.h>
+#include "nvrm-dirty-diagnostic.h"
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
@@ -109,13 +110,22 @@ OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
 static int gNvScanout = 0;
 static int gNvAperture = 0;
+// Global observation serial, not a per-display resource generation. Never use
+// this counter to release/invalidate resources; it only correlates log events.
+static volatile SInt32 gNMModeEventSerial = 0;
+static volatile SInt32 gNMDirtyReasonCounts[NMDirtyReasonCount] = {};
+
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
     OSDeclareDefaultStructors(NVDisplayMachine)
     NM_TAHOE_FWD(NVDisplayMachine)
 public:
-    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM displayModeWillChange"); return true; }
+    bool displayModeWillChange() APPLE_KEXT_OVERRIDE {
+        OSIncrementAtomic(&gNMModeEventSerial);
+        ALOG("DM displayModeWillChange observation %d", (int)OSAddAtomic(0, &gNMModeEventSerial));
+        return true;
+    }
     bool displayModeDidChange() APPLE_KEXT_OVERRIDE {
-        ALOG("DM displayModeDidChange -> true");
+        ALOG("DM displayModeDidChange -> true observation %d", (int)OSAddAtomic(0, &gNMModeEventSerial));
         if (gEnableAccel) gEnableAccel("displayModeDidChange");
         return true;
     }
@@ -1401,15 +1411,19 @@ static unsigned gNVSVOk, gNVSVRefused;
 static inline void nvSVZero(void *p, unsigned long n) { volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
 
 static unsigned gNVSVDirty, gNVSVDirtyRefused, gNVSVPageoff, gNVSVPageoffFail;
-static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
+static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane, NMDirtyReason *reason)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
     unsigned char type = r[0x14];
     unsigned int fl = *(volatile unsigned int *)(r + 0xc);
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
-    if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
+    *reason = nmDirtyValidityReason(type, fl, valid != nullptr, plane);
+    if (*reason != NMDirtyOK) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
-    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
+    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) {
+        *reason = NMDirtyPendingFull;
+        return NVRM_SS_NO_CACHE;
+    }
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
@@ -1451,7 +1465,21 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     NVResource *res = OSDynamicCast(NVResource, ctx);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     if (cmd == NVRM_ESC_SURF_DIRTY) {
-        p->status = (cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+        NMDirtyReason reason = nmDirtyResourceReason(cache != nullptr, res != nullptr,
+                                                     vm != nullptr, vm && vm->fRmHandle);
+        p->status = reason == NMDirtyOK ? nvAccelSurfDirty(cache, res, p->plane, &reason) : NVRM_SS_NO_CACHE;
+        if (reason != NMDirtyOK) {
+            OSIncrementAtomic(&gNMDirtyReasonCounts[reason]);
+            unsigned count = (unsigned)OSAddAtomic(0, &gNMDirtyReasonCounts[reason]);
+            if (nmDirtyShouldLog(count)) {
+                ALOG("hidpi-dirty reason %s count %u observation %d surface %u plane %u "
+                     "cache %u resource %u vidmem %u handle %u cookie %llu scanout %u",
+                     nmDirtyReasonName(reason), count, (int)OSAddAtomic(0, &gNMModeEventSerial),
+                     p->surfaceID, p->plane, cache ? 1u : 0u, res ? 1u : 0u, vm ? 1u : 0u,
+                     vm && vm->fRmHandle ? 1u : 0u, vm ? (unsigned long long)vm->fAllocationCookie : 0ull,
+                     vm && vm->fScanout ? 1u : 0u);
+            }
+        }
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
