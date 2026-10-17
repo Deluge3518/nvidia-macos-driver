@@ -1,0 +1,74 @@
+name: Build
+
+# NVAccel (macOS 15 and 26) and NVRMFB from this tree, plus the source-level tests. NVRM itself needs NVIDIA's Darwin RM
+# archive and is not built here; releases take it from the base package (release.yml).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+env:
+  OGKM_TAG: 610.57.04
+
+jobs:
+  kexts:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: open-gpu-kernel-modules headers
+        id: ogkm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ogkm
+          key: ogkm-${{ env.OGKM_TAG }}
+      - if: steps.ogkm.outputs.cache-hit != 'true'
+        run: git clone --quiet --depth 1 --branch "$OGKM_TAG" https://github.com/NVIDIA/open-gpu-kernel-modules "$RUNNER_TEMP/ogkm"
+      - name: NVAccel (macOS 15 and 26)
+        run: OGKM="$RUNNER_TEMP/ogkm" bash build/accel_build_all.sh "$PWD/kexts/NVRM" "$PWD/out/kexts"
+      - name: NVRMFB
+        run: OGKM="$RUNNER_TEMP/ogkm" bash build/fb_build.sh "$PWD/kexts/NVRMFB" "$PWD/out/kexts"
+      - name: Check the kexts
+        run: |
+          for k in out/kexts/NVRMFB.kext/Contents/MacOS/NVRMFB out/kexts/15/NVAccel.kext/Contents/MacOS/NVAccel out/kexts/26/NVAccel.kext/Contents/MacOS/NVAccel; do
+            lipo -archs "$k" | grep -qx x86_64 || { echo "$k is not x86_64"; exit 1; }
+            plutil -lint "$(dirname "$(dirname "$k")")/Info.plist"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kexts
+          path: |
+            out/kexts/NVRMFB.kext
+            out/kexts/15/NVAccel.kext
+            out/kexts/26/NVAccel.kext
+          if-no-files-found: error
+
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 1401.app
+        run: bash app/build.sh "$PWD/out/app"
+      - name: Zip
+        run: ditto -c -k --keepParent out/app/1401.app out/1401-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 1401-app
+          path: out/1401-Mac.zip
+          if-no-files-found: error
+
+  tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Source-level tests
+        run: |
+          fail=0
+          for t in tools/test_*.py; do
+            # takes the built diagnostics checker as its argument; tools/test_optional_diagnostics.sh runs it after app/build.sh
+            [ "$t" = tools/test_diagnostics_prerequisites.py ] && continue
+            if python3 "$t" > "$RUNNER_TEMP/t.log" 2>&1; then echo "ok   $t"
+            else echo "FAIL $t"; tail -20 "$RUNNER_TEMP/t.log" | sed 's/^/     /'; fail=1; fi
+          done
+          exit $fail

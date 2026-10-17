@@ -1,0 +1,77 @@
+name: Release
+
+# A tag v<version> publishes nullmoth-nvidia-<version>.tar.gz: the base package (BASE_VERSION, from BASE_REPO's release)
+# with the NVRMFB and NVAccel kexts this tree builds. The CHANGELOG section for <version> is the release text.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (it must already exist), e.g. v1.15.1'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BASE_REPO: nullmoth/nvidia-macos-driver
+  BASE_VERSION: 1.15.0
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: kexts
+          path: kx
+      - name: Base package
+        run: |
+          gh release download "v$BASE_VERSION" -R "$BASE_REPO" -D base -p "nullmoth-nvidia-$BASE_VERSION.tar.gz" -p SHA256SUMS.txt
+          (cd base && grep " nullmoth-nvidia-$BASE_VERSION.tar.gz\$" SHA256SUMS.txt | shasum -a 256 -c -)
+      - name: Package
+        run: |
+          VER=${TAG#v}
+          grep -q "^## $VER\$" CHANGELOG.md || { echo "CHANGELOG.md has no '## $VER' section"; exit 1; }
+          bash build/repack_release.sh "base/nullmoth-nvidia-$BASE_VERSION.tar.gz" kx "$VER" dist
+          # 1401 installs and updates to this package: its version and SHA-256 go into the app before it is built
+          SHA=$(shasum -a 256 "dist/nullmoth-nvidia-$VER.tar.gz" | cut -d' ' -f1)
+          sed -i '' -e "s/^    static let version = \".*\"/    static let version = \"$VER\"/" \
+                    -e "s/^    static let sha256 = \".*\"/    static let sha256 = \"$SHA\"/" app/Sources/main.swift
+          grep -q "static let sha256 = \"$SHA\"" app/Sources/main.swift || { echo "the package SHA-256 did not go into the app"; exit 1; }
+          APP_VERSION="$VER" bash app/build.sh "$PWD/out/app"
+          ditto -c -k --keepParent out/app/1401.app "dist/1401-Mac-$VER.zip"
+          mkdir -p out/dmg && cp -R out/app/1401.app out/dmg/ && ln -s /Applications out/dmg/Applications
+          hdiutil create -volname 1401 -srcfolder out/dmg -ov -format UDZO "dist/1401-Mac-$VER.dmg"
+          (cd dist && shasum -a 256 nullmoth-nvidia-$VER.tar.gz "1401-Mac-$VER.zip" "1401-Mac-$VER.dmg" > SHA256SUMS.txt)
+          {
+            awk -v v="## $VER" '$0==v{on=1;next} on&&/^## /{exit} on' CHANGELOG.md
+            echo
+            echo "### Install"
+            echo '```'
+            echo "tar -xzf nullmoth-nvidia-$VER.tar.gz && cd pkgroot"
+            echo "sudo ./install.sh"
+            echo '```'
+            echo
+            echo "Or install with the **1401** app (\`1401-Mac-$VER.dmg\`): it installs this driver and updates from this repository."
+            echo
+            echo "Built by CI from \`$(git rev-parse --short HEAD)\`: NVRMFB and NVAccel (macOS 15 and 26) are rebuilt from this tree;"
+            echo "NVRM, NVRMAGDC, the Metal userland and the GSP firmware are those of $BASE_REPO v$BASE_VERSION."
+          } > dist/notes.md
+          cat dist/notes.md
+      - name: Publish
+        run: |
+          VER=${TAG#v}
+          gh release create "$TAG" --verify-tag --title "Driver $VER" --notes-file dist/notes.md \
+            "dist/nullmoth-nvidia-$VER.tar.gz" "dist/1401-Mac-$VER.zip" "dist/1401-Mac-$VER.dmg" dist/SHA256SUMS.txt
