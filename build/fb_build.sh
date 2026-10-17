@@ -7,10 +7,12 @@ set -uo pipefail
 SRC=$1; OUT=$2; mkdir -p "$OUT/NVRMFB.kext/Contents/MacOS"
 OGKM=${OGKM:-$HOME/ogkm610}
 SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"; KMS="$OGKM/src/nvidia-modeset"
-# the same include set the modeset kext itself compiles with (utils.mk/os-interface), narrowed to what fb/nvrm-fb.cpp uses
+# the same include set the modeset kext itself compiles with, narrowed to what the nvkms include chain pulls:
+# nv-gpu-info.h (arch/nvalloc/unix/include), nv_dpy_id.h (common/unix/common/inc), nvtypes/nv_stdarg (sdk inc)
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" -I"$SRC/fb"
   -I"$KMS/os-interface/include" -I"$KMS/kapi/interface" -I"$KMS/kapi/include" -I"$KMS/include" -I"$KMS/interface"
   -I"$OGKM/src/common/sdk/nvidia/inc" -I"$OGKM/src/common/inc" -I"$OGKM/src/common/shared/inc"
+  -I"$OGKM/src/nvidia/arch/nvalloc/unix/include" -I"$OGKM/src/common/unix/common/inc"
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
   -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 )
