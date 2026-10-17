@@ -56,10 +56,13 @@ jobs:
   tests:
     runs-on: macos-15
     steps:
-      # full history: the negative-control tests read past sources with `git show v1.15.0:...` and `git show 4434649:...`
+      # full history: the negative-control tests read past sources with `git show v1.15.0:...` and `git show 4434649:...`.
+      # the fork carries no tags, so v1.15.0 is fetched straight from upstream
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Fetch the upstream tag the negative controls read
+        run: git fetch --quiet --depth 1 https://github.com/nullmoth/nvidia-macos-driver refs/tags/v1.15.0:refs/tags/v1.15.0
       - name: Source-level tests
         run: |
           fail=0
