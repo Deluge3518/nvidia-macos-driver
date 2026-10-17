@@ -46,17 +46,18 @@ jobs:
       - name: Package
         run: |
           VER=${TAG#v}
-          # the release text: this version's CHANGELOG section, else the base version's (a rebuild tag like
-          # v2.3.1-custom has no section of its own; the changes are listed under the base version)
+          # the release text: this version's CHANGELOG section, else the newest section the CHANGELOG has (a rebuild
+          # tag like v2.3.1-custom has no section of its own, and the fork's CHANGELOG may lag the base package's version)
           if grep -q "^## $VER\$" CHANGELOG.md; then
             awk -v v="## $VER" '$0==v{on=1;next} on&&/^## /{exit} on' CHANGELOG.md > dist-body.md
           else
-            grep -q "^## $BASE_VERSION\$" CHANGELOG.md || { echo "CHANGELOG.md has neither '## $VER' nor '## $BASE_VERSION'"; exit 1; }
+            NEWEST=$(grep -m1 '^## ' CHANGELOG.md | sed 's/^## //')
+            [ -n "$NEWEST" ] || { echo 'CHANGELOG.md has no "## version" sections'; exit 1; }
             {
-              awk -v v="## $BASE_VERSION" '$0==v{on=1;next} on&&/^## /{exit} on' CHANGELOG.md
+              awk -v v="## $NEWEST" '$0==v{on=1;next} on&&/^## /{exit} on' CHANGELOG.md
               echo
-              echo "> This is a rebuild of $BASE_VERSION: the CHANGELOG section above is the base release's;"
-              echo "> NVAccel (macOS 15 and 26) and NVRMFB are rebuilt from this tree at \`$TAG\`."
+              echo "> This is a rebuild of $BASE_VERSION (CHANGELOG section above: $NEWEST); NVAccel (macOS 15 and 26)"
+              echo "> and NVRMFB are rebuilt from this tree at \`$TAG\`."
             } > dist-body.md
           fi
           bash build/repack_release.sh "base/nullmoth-nvidia-$BASE_VERSION.tar.gz" kx "$VER" dist
